@@ -5,16 +5,28 @@
     음성 ─[0] 로컬 ASR→ 텍스트 ─[1] 의도 추론→ Intent(JSON) ─[2] 게이트→[3] 실행→[4] 답변
                                   ↑ LLM은 여기 1회만        └──── 전부 로컬 결정적 코드 ────┘
 
+이 프로토타입의 중심은 기능 개수가 아니라 **기능 하나가 실제로 실행되기까지 통과해야 하는 검사**다.
+발화가 차량 동작이 되기까지 아래 7단계를 지나고, 어느 단계든 막히면 실행되지 않는다:
+
+    [1] 전사 신뢰도    확신이 낮은 전사는 다음 단계로 넘기지 않는다      transcribe()
+    [2] 값 존재        값이 없으면 추측하지 않고 되묻는다               _resolve() → None
+    [3] 범위 클램프    모델 출력은 신뢰 경계다. 실행 직전에 자른다       LIMITS
+    [4] 안전 게이트    통과 / 확인 필요 / 확인으로도 거부               safety_gate()
+    [5] 확인 유효기간  물어본 지 오래된 "응"은 동의가 아니다             CONFIRM_TTL_S
+    [6] 상태 재검사    묻는 사이 상태가 바뀌면 담아 둔 값을 버린다        _state_key()
+    [7] 실행 결과      실패를 성공이라고 답하지 않는다                   _run() try/except
+
 왜 이 구조인가:
 - 온디바이스 가정이라 모델 왕복을 1회로 고정했다. 게이트·실행·응답 문장은 전부 로컬 코드다.
-- "값이 없으면 추측하지 않고 되묻는다"(abstain)와 "되돌릴 수 없는 동작은 먼저 되묻는다"(confirmation)를
-  프롬프트가 아니라 코드에 박아 넣었다. 프롬프트는 모델이 어기지만 코드가 거부하면 못 어긴다.
+- 위 7단계는 프롬프트가 아니라 코드에 박혀 있다. 프롬프트는 모델이 어기지만 코드가 거부하면 못 어긴다.
 - 확인 대기(pending)는 로컬에만 있다. 모델은 "사용자가 동의했다"까지만 말할 수 있고 실행 인자는 다시
   만들지 못한다 — 모델이 제 손으로 확인 플래그를 켤 수 없다.
+- 확인이 만능은 아니다. [4]의 "refuse"는 승객이 동의해도 열리지 않는다 — 확인만으로 모든 것을 열면
+  안전 판단이 "응"이라고 말하는 승객에게 넘어간다.
 - 상대값("3도 올려")은 모델이 아니라 실행기가 현재 상태에 적용한다. 모델에 현재 온도를 줄 필요가 없고
   계산이 어긋날 수 없다.
-- 모델 출력은 신뢰 경계다. 스키마는 타입만 보장하므로 값 범위는 실행 직전에 자른다.
-- 평가가 없는 프로토타입은 주장이지 결과가 아니다. --eval이 튜닝셋/홀드아웃을 분리해 채점한다.
+- 평가가 없는 프로토타입은 주장이지 결과가 아니다. --eval이 튜닝셋/홀드아웃을 분리해 채점하고,
+  결정적인 안전 단계는 --selftest가 API 없이 고정한다.
 
 사용법:
     python car_agent.py --selftest                            # API 키 없이 로직만 검증
@@ -72,6 +84,13 @@ _INTENT_CACHE = {}
 LIMITS = {"celsius": (16.0, 30.0), "slide": (-10.0, 10.0), "height": (0.0, 10.0),
           "recline": (0.0, 45.0), "brightness": (0.0, 100.0)}
 
+# 안전 파이프라인 상수. 실차에서는 전부 튜닝 대상이라 값을 한곳에 모아 둔다.
+# ponytail: 임계값은 근거를 적어 두되 실측으로 정한 값이 아니다 — 실차 데이터가 생기면 다시 잡는다.
+CONFIRM_TTL_S = 30.0        # 확인 질문의 유효기간. 지나면 동의를 받아도 실행하지 않는다.
+POSTURE_REFUSE_KMH = 80.0   # 이 속도 이상에서는 시트 자세 변경을 확인으로도 열지 않는다.
+ASR_MIN_LOGPROB = -1.0      # 전사 신뢰도 하한. 이보다 낮으면 알아들은 것으로 치지 않는다.
+ASR_MAX_NOSPEECH = 0.6      # 무음 확률 상한. 이보다 높으면 발화가 아니었다고 본다.
+
 
 def reset_vehicle():
     """같은 시작 상태에서 출발시킨다. 상대값("3도 올려")의 정답이 시작 상태에 의존하므로,
@@ -86,13 +105,24 @@ _ASR = None
 
 
 def transcribe(audio_path):
-    """음성을 차 안에서 텍스트로 전사한다. 오디오는 이 함수 안에서만 다루고 이후 단계는 텍스트만 본다."""
+    """음성을 차 안에서 텍스트로 전사한다. 오디오는 이 함수 안에서만 다루고 이후 단계는 텍스트만 본다.
+
+    반환: (텍스트, None) 또는 (None, 사유). **ASR도 신뢰 경계다** — 모델 출력의 값 범위는
+    LIMITS로 자르지만, 그 앞단에서 잘못 들은 텍스트("3도"를 "8도"로)는 범위 안이라 걸러지지 않는다.
+    그래서 확신이 낮은 전사는 다음 단계로 넘기지 않고 되묻는다.
+    """
     global _ASR
     if _ASR is None:
         from faster_whisper import WhisperModel
         _ASR = WhisperModel(ASR_MODEL, device="cpu", compute_type="int8")
-    segments, _ = _ASR.transcribe(audio_path, language="ko")
-    return " ".join(s.text for s in segments).strip()
+    segments = list(_ASR.transcribe(audio_path, language="ko")[0])
+    text = " ".join(s.text for s in segments).strip()
+    if not segments or not text:
+        return None, "말씀을 알아듣지 못했습니다. 다시 말씀해 주세요."
+    if (min(s.avg_logprob for s in segments) < ASR_MIN_LOGPROB
+            or max(s.no_speech_prob for s in segments) > ASR_MAX_NOSPEECH):
+        return None, "잘 알아듣지 못했습니다. 다시 말씀해 주세요."
+    return text, None
 
 
 # ---------------------------------------------------------------- [1] 의도 추론 (LLM 유일 지점)
@@ -176,22 +206,65 @@ def parse_intent(utterance, pending=None, client=None):
 
 # ---------------------------------------------------------------- [2] 안전 게이트 + [3] 실행기
 
-def needs_confirmation(tool, args):
-    """되돌릴 수 없거나(외부 발신) 주행 중 자세를 바꾸는 동작만 확인을 요구한다.
-    목적지 변경은 여기 없다 — 사람이 계속 운전대를 잡고 있어 차가 알아서 이상하게 움직이지
-    않고, "다시 원래 목적지로" 한마디로 되돌릴 수 있다. 통화·메시지(외부로 나가면 되돌릴 수
-    없음)나 등받이(벨트 유효성 저하)와 위험 범주가 다르다."""
+def safety_gate(tool, args):
+    """실행 전 안전 판정. 모든 차량 제어가 `_run()`에서 이 함수를 반드시 한 번 지난다.
+
+    반환:
+        None        바로 실행해도 되는 동작
+        "confirm"   사용자 확인을 받아야 실행 (되돌릴 수 없거나, 지금 상태에서 위험)
+        "refuse"    **확인을 받아도 실행하지 않는다** — 동의로 열 수 없는 구간
+
+    "refuse" 단계가 따로 있는 이유: 확인만으로 모든 것을 열 수 있으면, 승객이 "응"이라고
+    말하는 순간 안전 판단이 승객에게 넘어간다. 고속 주행처럼 판단 근거가 차량 상태에 있는
+    경우엔 시스템이 거부하는 편이 맞다.
+
+    목적지 변경은 어느 단계에도 없다 — 사람이 계속 운전대를 잡고 있어 차가 알아서 이상하게
+    움직이지 않고 "다시 원래 목적지로" 한마디로 되돌릴 수 있다. 통화·메시지(외부로 나가면
+    되돌릴 수 없음)나 시트 자세(벨트·페달)와 위험 범주가 다르다.
+    """
     if tool in ("make_phone_call", "send_message"):
-        return True
+        return "confirm"                      # 외부로 나가면 되돌릴 수 없다
     if tool == "set_seat_position":
-        # 주행 중 등받이 각도 변경은 벨트 유효성을 떨어뜨려 확인이 필요하다. 슬라이드/높이는 그대로 둔다.
-        return VEHICLE["speed_kmh"] > 0 and args.get("recline") is not None
-    return False
+        # 등받이 각도는 벨트 유효성을, 슬라이드는 페달 도달 거리를 바꾼다. 둘 다 주행 중 자세 변경이다.
+        # 높이는 어느 쪽도 건드리지 않으므로 제외한다.
+        if not any(args.get(k) is not None for k in ("recline", "slide")):
+            return None
+        speed = VEHICLE["speed_kmh"]
+        if speed >= POSTURE_REFUSE_KMH:
+            return "refuse"
+        return "confirm" if speed > 0 else None
+    return None
+
+
+def _apply(tool, args):
+    """실제 차량 상태 변경. 실차에서는 CAN/차량 API 호출이 들어올 자리이고,
+    그래서 `_run()`이 이 호출을 감싸 실패를 잡는다 — 목업이라 성공만 하는 것처럼 보이면 안 된다."""
+    if tool == "set_navigation_destination":
+        VEHICLE["destination"] = args["destination"]
+    elif tool == "set_climate_temperature":
+        VEHICLE["cabin_temp"] = args["celsius"]
+    elif tool == "set_seat_position":
+        seat = VEHICLE["seat"].setdefault(args.get("zone", "driver"),
+                                          {"slide": 0.0, "height": 0.0, "recline": 0.0})
+        for k in ("slide", "height", "recline"):
+            if args.get(k) is not None:
+                seat[k] = args[k]
+    elif tool == "set_ambient_light":
+        for k in ("brightness", "color"):
+            if args.get(k) is not None:
+                VEHICLE["ambient_light"][k] = args[k]
 
 
 def _run(tool, args, confirmed):
-    """모든 차량 제어의 공통 실행 경로. 게이트를 여기 한 곳에서만 통과시킨다."""
-    if needs_confirmation(tool, args) and not confirmed:
+    """모든 차량 제어의 공통 실행 경로. 안전 검사는 전부 여기 한 곳을 지난다.
+
+        [1] 안전 게이트 → [2] 실행 → [3] 실행 결과 확인
+
+    confirmed는 [1]의 "confirm"만 연다. "refuse"는 열지 못한다."""
+    verdict = safety_gate(tool, args)
+    if verdict == "refuse":
+        result = {"status": "refused", "reason": _refuse_reason(tool)}
+    elif verdict == "confirm" and not confirmed:
         result = {"status": "confirmation_required",
                   "ask_user": f"{_describe(tool, args)} 실행할까요?"}
     elif tool == "get_cabin_sensors":
@@ -204,23 +277,23 @@ def _run(tool, args, confirmed):
             "sunload_pct": VEHICLE["sunload"],
         }}
     else:
-        result = {"status": "ok", "applied": _describe(tool, args)}
-        if tool == "set_navigation_destination":
-            VEHICLE["destination"] = args["destination"]
-        elif tool == "set_climate_temperature":
-            VEHICLE["cabin_temp"] = args["celsius"]
-        elif tool == "set_seat_position":
-            seat = VEHICLE["seat"].setdefault(args.get("zone", "driver"),
-                                              {"slide": 0.0, "height": 0.0, "recline": 0.0})
-            for k in ("slide", "height", "recline"):
-                if args.get(k) is not None:
-                    seat[k] = args[k]
-        elif tool == "set_ambient_light":
-            for k in ("brightness", "color"):
-                if args.get(k) is not None:
-                    VEHICLE["ambient_light"][k] = args[k]
+        try:
+            _apply(tool, args)
+        except Exception as e:  # 실행이 실패해도 성공했다고 답하지 않는다
+            result = {"status": "failed",
+                      "reason": f"{_describe(tool, args)}하지 못했습니다. 다시 시도할까요?",
+                      "error": type(e).__name__}
+        else:
+            result = {"status": "ok", "applied": _describe(tool, args)}
     CALL_LOG.append((tool, args, result["status"]))
     return json.dumps(result, ensure_ascii=False)
+
+
+def _refuse_reason(tool):
+    if tool == "set_seat_position":
+        return (f"주행 중({VEHICLE['speed_kmh']:g}km/h)에는 시트 자세를 바꾸지 않습니다. "
+                "정차 후 다시 말씀해 주세요.")
+    return "지금은 실행할 수 없습니다."
 
 
 def _describe_seat(a):
@@ -236,7 +309,9 @@ def _describe(tool, a):
         "set_climate_temperature": lambda: f"{a.get('zone', 'all')} 구역 온도를 {a['celsius']:g}도로 설정",
         "play_media": lambda: f"'{a['query']}' 재생",
         "make_phone_call": lambda: f"{a['contact']}에게 전화",
-        "send_message": lambda: f"{a['contact']}에게 메시지 전송",
+        # 되돌릴 수 없는 외부 발신이므로 확인 질문에 본문을 그대로 보여준다 —
+        # 무엇을 보내는지 모르고 "응"이라고 답하게 두면 확인 절차가 형식만 남는다.
+        "send_message": lambda: f"{a['contact']}에게 \"{a['message']}\" 전송",
         "set_seat_position": lambda: _describe_seat(a),
         "set_ambient_light": lambda: (f"조명 밝기 {a['brightness']:g}(으)로 설정"
                                       if a.get("brightness") is not None
@@ -273,7 +348,9 @@ def _resolve(intent):
         return "make_phone_call", {"contact": intent.contact}, None
 
     if d == "call_message" and a == "send_message" and intent.contact:
-        return "send_message", {"contact": intent.contact, "message": intent.text or ""}, None
+        if not intent.text:
+            return None, None, None  # 본문 없이 외부로 내보내지 않는다 — 값이 없으면 되묻는다
+        return "send_message", {"contact": intent.contact, "message": intent.text}, None
 
     if d == "vehicle_setting" and a == "set_seat":
         axis = intent.target if intent.target in ("slide", "height", "recline") else None
@@ -309,7 +386,7 @@ def _resolve(intent):
 def _answer(result, tool, args, note=None):
     """템플릿이라 모델을 한 번 더 부르지 않는다 — 왕복 1회를 지킨다."""
     if result["status"] != "ok":
-        return result.get("ask_user", "실행하지 못했습니다.")
+        return result.get("ask_user") or result.get("reason") or "실행하지 못했습니다."
     if tool == "get_cabin_sensors":
         s = result["sensors"]
         return (f"실내 {s['cabin_temp_c']:g}도, 습도 {s['humidity_pct']:g}%, "
@@ -317,11 +394,33 @@ def _answer(result, tool, args, note=None):
     return f"{result['applied']}했습니다." + (f" {note}" if note else "")
 
 
-def dispatch(intent, pending=None):
+def _state_key(tool, args):
+    """확인을 물은 시점의 차량 상태 지문.
+
+    상대값으로 만든 인자는 절대값으로 굳어서 pending에 담긴다("5도 더" → recline 10.0).
+    확인을 기다리는 사이에 그 상태가 바뀌면 담아 둔 값은 더 이상 승객이 말한 뜻이 아니다.
+    상태와 무관한 동작(전화·메시지·목적지·미디어)은 None이라 이 검사를 타지 않는다."""
+    if tool == "set_seat_position":
+        return json.dumps(VEHICLE["seat"].get(args.get("zone", "driver")), sort_keys=True)
+    if tool == "set_climate_temperature":
+        return VEHICLE["cabin_temp"]
+    if tool == "set_ambient_light":
+        return json.dumps(VEHICLE["ambient_light"], sort_keys=True)
+    return None
+
+
+def dispatch(intent, pending=None, now=None):
     """Intent → (답변 문장, 다음 pending). 실행·확인·되묻기가 전부 여기서 결정된다."""
+    now = time.monotonic() if now is None else now
     # 확인 응답: 실행 인자는 pending에서만 온다. 모델이 새로 만든 값으로는 실행하지 않는다.
     if pending and pending.get("tool"):
         if intent.confirm == "yes":
+            # 확인에는 유효기간이 있다. 물어본 지 한참 지난 "응"은 그 동작에 대한 동의가 아니다.
+            if now > pending["expires_at"]:
+                return "확인을 기다린 시간이 지나 취소했습니다. 다시 말씀해 주세요.", None
+            # 물어본 뒤 차량 상태가 바뀌었으면 담아 둔 값은 이미 승객이 말한 뜻이 아니다.
+            if _state_key(pending["tool"], pending["args"]) != pending["state_key"]:
+                return "그 사이 차량 상태가 바뀌어 실행하지 않았습니다. 다시 말씀해 주세요.", None
             r = json.loads(_run(pending["tool"], pending["args"], confirmed=True))
             return _answer(r, pending["tool"], pending["args"], pending.get("note")), None
         if intent.confirm == "no":
@@ -333,12 +432,15 @@ def dispatch(intent, pending=None):
 
     tool, args, note = _resolve(intent)
     if tool is None:
-        q = intent.question or "값을 알려주시면 실행하겠습니다. 얼마로 할까요?"
+        # 폴백은 도메인과 무관하게 맞아야 한다 — 빠진 것이 온도일 수도, 메시지 본문일 수도 있다.
+        q = intent.question or "필요한 내용을 알려주시면 실행하겠습니다."
         return q, {"question": q}
 
     r = json.loads(_run(tool, args, confirmed=False))
     if r["status"] == "confirmation_required":
-        return r["ask_user"], {"question": r["ask_user"], "tool": tool, "args": args, "note": note}
+        return r["ask_user"], {"question": r["ask_user"], "tool": tool, "args": args, "note": note,
+                               "expires_at": now + CONFIRM_TTL_S,
+                               "state_key": _state_key(tool, args)}
     return _answer(r, tool, args, note), None
 
 
@@ -441,21 +543,31 @@ def selftest():
     """API 없이 도는 검증. 게이트·해석·대화흐름·채점이 깨지면 여기서 잡힌다."""
     reset_vehicle()
 
-    # --- 게이트
-    assert needs_confirmation("make_phone_call", {"contact": "엄마"})
-    assert needs_confirmation("send_message", {"contact": "엄마", "message": "곧 도착"})
+    # --- 게이트 3단계: 통과(None) / 확인(confirm) / 거부(refuse)
+    assert safety_gate("make_phone_call", {"contact": "엄마"}) == "confirm"
+    assert safety_gate("send_message", {"contact": "엄마", "message": "곧 도착"}) == "confirm"
     # 목적지 변경은 확인 없이 즉시 실행 — 사람이 운전 중이라 되돌리기 쉽고, 실제 내비 UX와 같다
-    assert not needs_confirmation("set_navigation_destination", {"destination": "부산"})
-    assert not needs_confirmation("set_climate_temperature", {"celsius": 22.0})
-    assert not needs_confirmation("play_media", {"query": "아이유"})
-    assert not needs_confirmation("get_cabin_sensors", {})
-    # 주행 중 등받이 각도 변경만 확인이 필요하다 — 벨트 유효성 저하라는 물리적 문제라 다르다
-    assert needs_confirmation("set_seat_position", {"recline": 20.0})
-    assert not needs_confirmation("set_seat_position", {"slide": 5.0})
-    assert not needs_confirmation("set_ambient_light", {"brightness": 70.0})
+    assert safety_gate("set_navigation_destination", {"destination": "부산"}) is None
+    assert safety_gate("set_climate_temperature", {"celsius": 22.0}) is None
+    assert safety_gate("play_media", {"query": "아이유"}) is None
+    assert safety_gate("get_cabin_sensors", {}) is None
+    assert safety_gate("set_ambient_light", {"brightness": 70.0}) is None
+    # 주행 중 자세 변경은 확인이 필요하다. 등받이는 벨트 유효성, 슬라이드는 페달 도달 거리를 바꾼다.
+    assert safety_gate("set_seat_position", {"recline": 20.0}) == "confirm"
+    assert safety_gate("set_seat_position", {"slide": 5.0}) == "confirm"
+    assert safety_gate("set_seat_position", {"height": 7.0}) is None  # 높이는 둘 다 안 건드린다
 
-    VEHICLE.update(speed_kmh=0)  # 정차 중에는 등받이 변경에 확인이 필요 없다
-    assert not needs_confirmation("set_seat_position", {"recline": 20.0})
+    VEHICLE.update(speed_kmh=0)  # 정차 중에는 자세 변경에 확인이 필요 없다
+    assert safety_gate("set_seat_position", {"recline": 20.0}) is None
+    assert safety_gate("set_seat_position", {"slide": 5.0}) is None
+    assert safety_gate("make_phone_call", {"contact": "엄마"}) == "confirm"  # 통화는 속도와 무관
+
+    VEHICLE.update(speed_kmh=100)  # 고속에서는 자세 변경을 확인으로도 열지 않는다
+    assert safety_gate("set_seat_position", {"recline": 20.0}) == "refuse"
+    assert safety_gate("set_seat_position", {"height": 7.0}) is None  # 높이는 여전히 통과
+    r = json.loads(_run("set_seat_position", {"zone": "driver", "recline": 20.0}, confirmed=True))
+    assert r["status"] == "refused", r                    # confirmed=True로도 못 연다
+    assert VEHICLE["seat"]["driver"]["recline"] != 20.0   # 상태도 안 바뀐다
     reset_vehicle()
 
     # --- 실행 경로
@@ -516,6 +628,53 @@ def selftest():
     dispatch(Intent(domain="none", action="none", confirm="yes"))
     assert not CALL_LOG, CALL_LOG
 
+    # --- 확인 만료: 물어본 지 오래된 "응"은 그 동작에 대한 동의가 아니다
+    reset_vehicle()
+    CALL_LOG.clear()
+    _, pend = dispatch(Intent(domain="call_message", action="call", contact="엄마"), now=1000.0)
+    ans, pend2 = dispatch(Intent(domain="none", action="none", confirm="yes"), pending=pend,
+                          now=1000.0 + CONFIRM_TTL_S + 0.1)
+    assert "시간이 지나" in ans and pend2 is None, ans
+    assert CALL_LOG[-1][2] == "confirmation_required"  # 실행 기록이 추가되지 않았다
+    # 유효기간 안이면 정상 실행된다
+    ans, _ = dispatch(Intent(domain="none", action="none", confirm="yes"), pending=pend,
+                      now=1000.0 + CONFIRM_TTL_S - 0.1)
+    assert CALL_LOG[-1][2] == "ok", CALL_LOG
+
+    # --- 상태 변경 재검사: 물어본 뒤 차량 상태가 바뀌면 담아 둔 값으로 실행하지 않는다
+    reset_vehicle()
+    CALL_LOG.clear()
+    _, pend = dispatch(Intent(domain="vehicle_setting", action="set_seat",
+                              target="recline", value=5, relative=True))  # 5 + 5 = 10.0
+    assert pend["tool"] == "set_seat_position" and pend["args"]["recline"] == 10.0, pend
+    VEHICLE["seat"]["driver"]["recline"] = 30.0        # 그 사이 시트가 다른 경로로 움직였다
+    ans, pend2 = dispatch(Intent(domain="none", action="none", confirm="yes"), pending=pend)
+    assert "차량 상태가 바뀌어" in ans and pend2 is None, ans
+    assert VEHICLE["seat"]["driver"]["recline"] == 30.0, VEHICLE["seat"]  # 10.0으로 덮어쓰지 않았다
+
+    # --- 실행 실패: 성공했다고 답하지 않는다
+    reset_vehicle()
+    CALL_LOG.clear()
+    _orig_apply = globals()["_apply"]
+    try:
+        globals()["_apply"] = lambda *a: (_ for _ in ()).throw(TimeoutError("CAN timeout"))
+        r = json.loads(_run("set_climate_temperature", {"celsius": 22.0}, confirmed=False))
+    finally:
+        globals()["_apply"] = _orig_apply
+    assert r["status"] == "failed" and r["error"] == "TimeoutError", r
+    assert CALL_LOG[-1][2] == "failed"
+    assert "하지 못했습니다" in _answer(r, "set_climate_temperature", {"celsius": 22.0})
+
+    # --- 메시지: 본문 없이 외부로 나가지 않고, 확인 질문이 본문을 보여준다
+    reset_vehicle()
+    t, _, _ = _resolve(Intent(domain="call_message", action="send_message", contact="여보"))
+    assert t is None                                   # 본문 없으면 실행 인자를 만들지 않는다
+    t, a, _ = _resolve(Intent(domain="call_message", action="send_message",
+                              contact="여보", text="늦어요"))
+    assert (t, a["message"]) == ("send_message", "늦어요")
+    r = json.loads(_run("send_message", a, confirmed=False))
+    assert "늦어요" in r["ask_user"], r                 # 무엇을 보내는지 보여주고 확인받는다
+
     # 거절하면 실행하지 않는다
     reset_vehicle()
     CALL_LOG.clear()
@@ -567,7 +726,8 @@ def selftest():
     assert m["tool_accuracy"] == 1.0 and m["arg_accuracy"] == 1.0 and m["gate_accuracy"] == 0.0, m
 
     assert len(CASES) == 23 and sum(1 for c in CASES if c[4] == "holdout") == 9
-    print("selftest OK — 게이트 10, 실행경로 5, 해석 4, 시트zone 4, 대화흐름 5, 캐시 3, 채점 5, "
+    print("selftest OK — 게이트3단계 17, 실행경로 5, 해석 4, 시트zone 4, 대화흐름 5, "
+          "확인만료 3, 상태재검사 3, 실행실패 3, 메시지본문 4, 캐시 3, 채점 5, "
           "케이스 23(홀드아웃 9)")
 
 
@@ -587,7 +747,10 @@ if __name__ == "__main__":
     else:
         utterances = list(a.say or [])
         if a.listen:
-            text = transcribe(a.listen)
+            text, asr_error = transcribe(a.listen)
+            if asr_error:  # 확신이 낮은 전사는 다음 단계로 넘기지 않는다 (두 번째 신뢰 경계)
+                print(f"[전사 실패] {asr_error}")
+                sys.exit(1)
             print(f"[전사] {text}")
             utterances.insert(0, text)
         pending = None
