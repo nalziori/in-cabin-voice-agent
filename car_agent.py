@@ -114,6 +114,10 @@ class Intent(BaseModel):
         default=None,
         description="세부 대상. 공조는 driver/passenger/all, 시트는 slide/height/recline, "
                     "조명은 brightness 또는 color.")
+    seat_zone: Optional[Literal["driver", "passenger"]] = Field(
+        default=None,
+        description='시트 조작 대상 좌석. "조수석"처럼 명시가 있을 때만 채우고, 없으면 비워둔다 '
+                    "(비어 있으면 운전석으로 처리된다).")
     contact: Optional[str] = Field(default=None, description="통화·메시지 상대.")
     text: Optional[str] = Field(
         default=None, description="메시지 본문·재생 대상·목적지·조명 색상 중 해당하는 하나.")
@@ -275,11 +279,12 @@ def _resolve(intent):
         axis = intent.target if intent.target in ("slide", "height", "recline") else None
         if axis is None:
             return None, None, None
-        before = VEHICLE["seat"]["driver"][axis]
+        zone = intent.seat_zone or "driver"  # 명시 없으면 운전석 — 화자 구분이 없어 이게 최선의 기본값
+        before = VEHICLE["seat"].get(zone, {}).get(axis, 0.0)
         v = num(axis, before)
         if v is None:
             return None, None, None
-        return "set_seat_position", {"zone": "driver", axis: v}, note(before, v)
+        return "set_seat_position", {"zone": zone, axis: v}, note(before, v)
 
     if d == "vehicle_setting" and a == "set_light":
         if intent.target == "color" and intent.text:
@@ -478,6 +483,20 @@ def selftest():
                               target="recline", value=5, relative=True))
     assert a["recline"] == 10.0, a                       # 5 + 5
 
+    # --- 시트 zone: 명시 없으면 운전석 기본값, 명시하면 그 좌석 (하드코딩 버그 수정)
+    reset_vehicle()
+    t, a, _ = _resolve(Intent(domain="vehicle_setting", action="set_seat",
+                              target="height", value=7))
+    assert (t, a["zone"]) == ("set_seat_position", "driver"), (t, a)  # 기본값은 그대로 driver
+    t, a, _ = _resolve(Intent(domain="vehicle_setting", action="set_seat",
+                              target="recline", value=15, seat_zone="passenger"))
+    assert (t, a["zone"], a["recline"]) == ("set_seat_position", "passenger", 15.0), (t, a)
+    # 조수석은 아직 한 번도 조작된 적 없어도 0.0에서 시작한다 (운전석 값을 잘못 참조하지 않는다)
+    t, a, _ = _resolve(Intent(domain="vehicle_setting", action="set_seat",
+                              target="recline", value=5, relative=True, seat_zone="passenger"))
+    assert a["recline"] == 5.0, a                        # 0.0 + 5, 운전석의 5.0이 아니다
+    assert VEHICLE["seat"]["driver"]["recline"] == 5.0   # 운전석 상태는 안 건드렸다
+
     # --- 되묻기: 값 없는 발화는 실행되지 않는다
     reset_vehicle()
     CALL_LOG.clear()
@@ -548,7 +567,8 @@ def selftest():
     assert m["tool_accuracy"] == 1.0 and m["arg_accuracy"] == 1.0 and m["gate_accuracy"] == 0.0, m
 
     assert len(CASES) == 23 and sum(1 for c in CASES if c[4] == "holdout") == 9
-    print("selftest OK — 게이트 10, 실행경로 5, 해석 4, 대화흐름 5, 캐시 3, 채점 5, 케이스 23(홀드아웃 9)")
+    print("selftest OK — 게이트 10, 실행경로 5, 해석 4, 시트zone 4, 대화흐름 5, 캐시 3, 채점 5, "
+          "케이스 23(홀드아웃 9)")
 
 
 if __name__ == "__main__":
