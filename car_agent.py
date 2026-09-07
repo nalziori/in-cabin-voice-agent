@@ -61,6 +61,13 @@ VEHICLE = copy.deepcopy(_VEHICLE_INIT)
 
 CALL_LOG = []  # [(tool_name, args, result_status)] — 평가·디버깅용 단일 기록처
 
+# 발화 캐시: pending이 없는(문맥 의존이 아닌) 완전히 동일한 발화만 캐싱한다.
+# Intent 분류는 발화 텍스트만의 함수다 — 차량상태 스냅샷은 프롬프트에 들어가지만 모델이 그걸로
+# domain/action/value를 바꾸지 않는다(상대값 계산은 _resolve()가 함, 결정 4). 그래서 같은 문자열은
+# 언제 다시 말해도 같은 Intent가 나오는 게 맞다. pending이 있으면 얘기가 다르다 — "3도"나 "네" 같은
+# 짧은 발화는 직전 질문이 뭐였느냐에 따라 뜻이 달라지므로 절대 캐싱하지 않는다.
+_INTENT_CACHE = {}
+
 # 모델 출력은 신뢰 경계다. 스키마는 타입만 보장하므로 값 범위는 실행 직전 여기서 자른다.
 LIMITS = {"celsius": (16.0, 30.0), "slide": (-10.0, 10.0), "height": (0.0, 10.0),
           "recline": (0.0, 45.0), "brightness": (0.0, 100.0)}
@@ -132,7 +139,11 @@ SYSTEM = """너는 차량 인캐빈 음성 어시스턴트의 의도 추론기�
 
 
 def parse_intent(utterance, pending=None, client=None):
-    """텍스트 → Intent. LLM 왕복은 여기 한 번뿐이다."""
+    """텍스트 → Intent. LLM 왕복은 여기 한 번뿐이다.
+    pending이 없으면 발화 캐시를 먼저 본다 — 완전히 동일한 문자열을 다시 말하면 API를 안 부른다."""
+    if pending is None and utterance in _INTENT_CACHE:
+        return _INTENT_CACHE[utterance]
+
     import anthropic
 
     client = client or anthropic.Anthropic()
@@ -153,7 +164,10 @@ def parse_intent(utterance, pending=None, client=None):
     except TypeError:  # ponytail: output_config를 못 받으면 빼고 간다. 받으면 저지연.
         kwargs.pop("output_config")
         response = client.messages.parse(**kwargs)
-    return response.parsed_output
+    intent = response.parsed_output
+    if pending is None:
+        _INTENT_CACHE[utterance] = intent
+    return intent
 
 
 # ---------------------------------------------------------------- [2] 안전 게이트 + [3] 실행기
@@ -386,6 +400,7 @@ def score(rows):
 
 
 def run_eval(split=None):
+    _INTENT_CACHE.clear()  # 케이스마다 진짜 API 응답을 재는 게 목적이라 캐시를 지우고 시작한다
     cases = [c for c in CASES if split in (None, c[4])]
     rows, lat = [], []
     for utt, exp_tool, exp_args, exp_gate, sp in cases:
@@ -489,6 +504,32 @@ def selftest():
     ans, pend2 = dispatch(Intent(domain="none", action="none", confirm="no"), pending=pend)
     assert ans == "취소했습니다." and CALL_LOG[-1][2] == "confirmation_required" and pend2 is None
 
+    # --- 발화 캐시: pending 없는 동일 발화는 API를 다시 안 부른다
+    _INTENT_CACHE.clear()
+
+    class _FakeMessages:
+        def __init__(self, intent):
+            self.calls = 0
+            self._intent = intent
+
+        def parse(self, **kwargs):
+            self.calls += 1
+            return type("R", (), {"parsed_output": self._intent})()
+
+    class _FakeClient:
+        def __init__(self, intent):
+            self.messages = _FakeMessages(intent)
+
+    fake = _FakeClient(Intent(domain="climate", action="set_temperature", value=22.0))
+    i1 = parse_intent("에어컨 22도로 맞춰줘", client=fake)
+    i2 = parse_intent("에어컨 22도로 맞춰줘", client=fake)
+    assert fake.messages.calls == 1, fake.messages.calls  # 두 번째는 캐시에서 옴
+    assert i1 is i2
+    # pending이 있으면(문맥 의존 발화) 같은 문자열이어도 캐시를 쓰지 않는다
+    parse_intent("3도", pending={"question": "몇 도로 올릴까요?"}, client=fake)
+    assert fake.messages.calls == 2
+    _INTENT_CACHE.clear()
+
     # --- 채점
     perfect = [("play_media", {"query": "x"}, "ok", "play_media", {"query": "x"}, "ok"),
                (None, {}, None, None, {}, None)]
@@ -507,7 +548,7 @@ def selftest():
     assert m["tool_accuracy"] == 1.0 and m["arg_accuracy"] == 1.0 and m["gate_accuracy"] == 0.0, m
 
     assert len(CASES) == 23 and sum(1 for c in CASES if c[4] == "holdout") == 9
-    print("selftest OK — 게이트 10, 실행경로 5, 해석 4, 대화흐름 5, 채점 5, 케이스 23(홀드아웃 9)")
+    print("selftest OK — 게이트 10, 실행경로 5, 해석 4, 대화흐름 5, 캐시 3, 채점 5, 케이스 23(홀드아웃 9)")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,8 @@
 - **holdout 케이스는 튜닝에 쓰지 않는다.**
 - **센서 스냅샷은 user 메시지에 붙인다.** 시스템 프롬프트는 고정 — 매 요청 바뀌는 값을 system에
   넣으면 프롬프트 캐시가 매번 깨진다.
+- **발화 캐시(`_INTENT_CACHE`)는 `pending`이 없을 때만 쓴다.** "3도"·"네" 같은 문맥 의존 발화는
+  직전 질문에 따라 뜻이 달라지므로, pending이 있으면 같은 문자열이어도 캐시를 보지 않는다.
 
 ## 재현성
 
@@ -56,7 +58,7 @@ $s.Speak('에어컨 온도 좀 높여줘'); $s.Dispose()
 | `_VEHICLE_INIT` / `VEHICLE` / `reset_vehicle()` | 차량 상태 + 센서 목업 |
 | `LIMITS` | 값 범위. 모델 출력을 자르는 곳 |
 | `transcribe()` | [0] 로컬 ASR. 오디오는 이 함수 밖으로 나가지 않는다 |
-| `Intent` / `SYSTEM` / `parse_intent()` | [1] 의도 추론. **LLM 유일 지점** |
+| `Intent` / `SYSTEM` / `parse_intent()` / `_INTENT_CACHE` | [1] 의도 추론. **LLM 유일 지점** + 동일 발화 캐시 |
 | `needs_confirmation()` / `_run()` | [2][3] 게이트와 단일 실행 경로 |
 | `_resolve()` | Intent → (기능, 인자). 상대값 적용 + 범위 클램프 |
 | `dispatch()` | 되묻기·확인·실행 분기 |
@@ -79,6 +81,6 @@ python car_agent.py --eval [--split tune|holdout]
 
 ## 남은 일
 
-- **`--eval` 실측** — 의도 추론 정확도·지연이 아직 없다. `ANTHROPIC_API_KEY` 필요.
-- **게이트 채점** — `run_eval`이 확인 요구 여부를 출력만 하고 `score()`에 넘기지 않는다.
-  핵심 주장인데 지표에 없다. `CASES`에 기대 게이트 한 칸 추가 + `gate_accuracy` 한 줄이면 된다.
+- **relative 오분류 별도 집계** — "3도 올려" 류 상대값 케이스가 절대값으로 잘못 해석되는지.
+  tune·holdout 각 1건씩만 있어 표본이 작다.
+- 이번 세션 실측치(정확도·지연·비용·캐시 적중)를 이력서·포트폴리오에 반영 — `NOTES.private.md` 참고.
