@@ -149,6 +149,10 @@ python car_agent.py --eval --split holdout             # 홀드아웃 채점
 23건 전체(tune+holdout) API 비용은 **$0.07**이었다(Claude Opus 5, effort=low, SYSTEM 프롬프트
 캐싱 적용). 정확도 검증 자체는 저렴하다 — 비싼 건 모델을 쓰는 매 순간이 아니라 잘못된 실행이다.
 
+캐싱 적중도 실측했다: 동일 요청을 2회 호출하면 1회차는 `cache_creation_input_tokens=2276`
+(SYSTEM+구조화 출력 스키마를 합친 크기), 2회차부터 `cache_read_input_tokens=2276`으로 그 부분을
+0.1배 가격에 읽는다.
+
 ## 알려진 한계
 
 - **차량 연동은 목업이다.** 실제 CAN/차량 API에 붙지 않는다. 검증한 것은 연동이 아니라
