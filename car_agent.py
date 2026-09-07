@@ -34,6 +34,7 @@
     python car_agent.py --say "온도 좀 높여줘" --say "3도"      # 되묻기 후 이어서 (대화 유지)
     python car_agent.py --listen sample.wav                    # 음성 → 로컬 전사 → 처리
     python car_agent.py --eval [--split holdout]               # 채점 (API 호출 발생)
+    python car_agent.py --eval --split tune --repeat 5         # 5회 반복 — 실행 간 변이 확인
 """
 
 import argparse
@@ -578,6 +579,30 @@ def run_eval(split=None):
     return m
 
 
+def repeat_eval(split, times):
+    """같은 split을 여러 번 돌려 실행 간 변이를 본다.
+
+    단일 실행의 100%는 "이 실행에서 틀리지 않았다"까지만 뜻한다. 같은 케이스가 실행에 따라
+    맞기도 틀리기도 하는 것을 실제로 관측했으므로(2026-09-07), 안정성을 말하려면 분산을 봐야 한다.
+    캐시는 run_eval이 매 회차 비우므로 회차마다 진짜 API 응답을 다시 받는다."""
+    keys = ("tool_accuracy", "arg_accuracy", "gate_accuracy", "abstain_accuracy")
+    runs = []
+    for i in range(times):
+        print(f"\n===== {i + 1}/{times} =====")
+        runs.append(run_eval(split))
+
+    print(f"\n  === {times}회 반복 요약 (split={split or 'all'}, n={runs[0]['n']}) ===")
+    for k in keys:
+        vs = [r[k] for r in runs]
+        spread = ("전 회차 동일" if min(vs) == max(vs)
+                  else f"표준편차 {statistics.pstdev(vs):.3f}")
+        print(f"  {k:17s} 평균 {statistics.mean(vs):6.1%}  최저 {min(vs):6.1%}  "
+              f"최고 {max(vs):6.1%}  ({spread})")
+    perfect = sum(1 for r in runs if all(r[k] == 1.0 for k in keys))
+    print(f"  네 지표가 모두 100%였던 실행: {perfect}/{times}")
+    return runs
+
+
 # ---------------------------------------------------------------- 오프라인 자체 검증
 
 def selftest():
@@ -794,13 +819,15 @@ if __name__ == "__main__":
     p.add_argument("--listen", help="음성 파일 경로 — 로컬 전사 후 처리")
     p.add_argument("--eval", action="store_true")
     p.add_argument("--split", choices=["tune", "holdout"])
+    p.add_argument("--repeat", type=int, default=1,
+                   help="--eval 반복 횟수. 실행 간 변이를 본다 (단일 실행 100%%는 안정성 근거가 아니다)")
     p.add_argument("--selftest", action="store_true")
     a = p.parse_args()
 
     if a.selftest or not (a.say or a.listen or a.eval):
         selftest()
     elif a.eval:
-        run_eval(a.split)
+        repeat_eval(a.split, a.repeat) if a.repeat > 1 else run_eval(a.split)
     else:
         utterances = list(a.say or [])
         if a.listen:
