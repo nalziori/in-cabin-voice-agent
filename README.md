@@ -1,389 +1,57 @@
-# 차량 인캐빈 AI Agent 프로토타입
+# In-Cabin Voice Agent
 
-승객의 음성을 차 안에서 텍스트로 옮기고, 그 텍스트에서 **목적과 호출할 기능을 확정한 뒤**,
-위험한 동작은 실행하기 전에 되묻는 인캐빈 음성 에이전트. 온디바이스 엣지 AI를 가정해 설계했다.
+A safety-oriented prototype for controlling vehicle functions by voice. The project turns a spoken request into a structured intent, applies explicit safety checks, and executes only the actions that remain valid at the moment of execution.
 
-차량 기능 호출은 틀렸을 때의 비용이 크다. 그래서 이 프로토타입이 실제로 다루는 문제는
-"얼마나 잘 알아듣는가"가 아니라 **"모르겠을 때와 위험할 때 무엇을 하는가"** 다.
+This is not a general-purpose assistant for a car. It is an experiment in a narrower question: **how should a vehicle interface behave when a request is incomplete, uncertain, or unsafe?**
 
-기능 개수는 이 프로젝트의 자랑거리가 아니다. 중심은 **기능 하나가 실제로 실행되기까지
-통과해야 하는 검사**이고, 발화가 차량 동작이 되기까지 아래 7단계를 지난다. 어느 단계든
-막히면 실행되지 않는다.
+## What it does
 
-| # | 검사 | 막히면 | 어디에 |
-|---|---|---|---|
-| 1 | 전사 신뢰도 | 되묻는다 | `transcribe()` |
-| 2 | 값 존재 | 되묻는다 | `_resolve()` → `None` |
-| 3 | 범위 클램프 | 잘라서 실행 | `LIMITS` |
-| 4 | 안전 게이트 | 확인받거나 **거부** | `safety_gate()` |
-| 5 | 확인 유효기간 | 취소하고 되묻는다 | `CONFIRM_TTL_S` |
-| 6 | 상태 재검사 | 취소하고 되묻는다 | `_state_key()` |
-| 7 | 실행 결과 | 실패를 알린다 | `_run()` |
+- Transcribes speech locally with `faster-whisper`.
+- Uses one structured-model call to identify an intent and its arguments.
+- Supports climate, phone and message actions, seat and lighting settings, navigation, media, and cabin-sensor queries.
+- Keeps execution, confirmation, and response generation in deterministic local code.
 
-7단계 전부 프롬프트가 아니라 코드에 있다. 모델의 판단이 달라져도 이 검사들은 그대로 돈다.
+## Safety model
 
+Every command passes through seven code-enforced checks before it can change vehicle state:
+
+1. Reject low-confidence transcription and ask the user to repeat it.
+2. Require all values needed to execute an action.
+3. Clamp valid numeric values to defined operating limits.
+4. Classify an action as allowed, confirmation-required, or refused.
+5. Expire confirmations after a short time window.
+6. Re-check relevant vehicle state immediately before execution.
+7. Surface execution failures instead of reporting a false success.
+
+The language model cannot approve its own action. A confirmation only unlocks locally stored pending state, and some conditions—such as unsafe seat movement at high speed—remain blocked even after confirmation.
+
+## Architecture
+
+```text
+Audio → local ASR → intent extraction (one model call) → safety gate → deterministic execution → response
 ```
-음성 ─[0] 로컬 ASR→ 텍스트 ─[1] 의도 추론→ Intent(JSON) ─[2] 게이트→[3] 실행→[4] 답변
-                              ↑ LLM은 여기 1회만        └──── 전부 로컬 결정적 코드 ────┘
-```
 
-## 빠른 시작
+The model produces a typed intent; local code resolves relative values, owns pending state, applies policy, and changes simulated vehicle state. This separation keeps critical behavior testable and avoids treating model output as an executable command.
+
+## Evaluation
+
+The repository evaluates tool selection, argument resolution, safety-gate behavior, and correct non-execution. A 23-case suite is split into 14 tuning cases and 9 holdout cases; vehicle state is reset for every case.
+
+The latest repeated run reports 100% on those four metrics across five repetitions of each split. This is a small prototype test set, not evidence of production-level reliability. The more durable result is the enforced control flow: missing values, unsafe requests, and untrusted instruction-like text cannot bypass the local gate.
+
+## Run it
 
 ```bash
 pip install -r requirements.txt
 
-python car_agent.py --selftest                        # API 키 없이 로직 검증
-python car_agent.py --say "에어컨 22도로"               # 발화 1건
-python car_agent.py --say "온도 좀 높여줘" --say "3도"   # 되묻기 후 이어서
-python car_agent.py --listen sample.wav                # 음성 → 로컬 전사 → 처리
-python car_agent.py --eval --split holdout             # 홀드아웃 채점
+python car_agent.py --selftest
+python car_agent.py --say "Set the air conditioning to 22 degrees"
+python car_agent.py --listen sample.wav
+python car_agent.py --eval --split holdout
 ```
 
-`--selftest`를 제외한 나머지는 `ANTHROPIC_API_KEY`가 필요하다.
-모델·응답속도·ASR 크기는 `CAR_AGENT_MODEL` / `CAR_AGENT_EFFORT` / `CAR_AGENT_ASR`로 바꾼다.
+`--selftest` runs without an API key. Other commands require `ANTHROPIC_API_KEY`. Model, reasoning effort, and ASR size are configurable with `CAR_AGENT_MODEL`, `CAR_AGENT_EFFORT`, and `CAR_AGENT_ASR`.
 
-## 동작 예시
+## Scope and limitations
 
-값이 명시된 경우 — 바로 실행한다.
-
-```
-발화: 에어컨 22도로 맞춰줘
-의도: {"domain":"climate","action":"set_temperature","value":22,"relative":false}
-답변: all 구역 온도를 22도로 설정했습니다.
-```
-
-값이 없는 경우 — **추측하지 않고 되묻는다.** 방향("높여줘")만으로는 실행하지 않는다.
-
-```
-발화: 에어컨 온도 좀 높여줘
-의도: {"domain":"none","action":"none","question":"몇 도로 올릴까요?"}
-답변: 몇 도로 올릴까요?
-
-발화: 3도
-의도: {"domain":"climate","action":"set_temperature","value":3,"relative":true}
-답변: all 구역 온도를 27도로 설정했습니다. (24 → 27)
-```
-
-되돌릴 수 없는 동작 — 실행 전에 확인한다.
-
-```
-발화: 엄마한테 전화 걸어줘
-호출: [('make_phone_call', {'contact': '엄마'}, 'confirmation_required')]
-답변: 엄마에게 전화 실행할까요?
-```
-
-## 설계 결정
-
-**1. LLM은 의도 추론 1회만.** 게이트·실행·응답 문장은 전부 로컬 결정적 코드다.
-온디바이스 가정에서 왕복이 잦을수록 불리하고, 안전 판정을 모델에 맡길 이유도 없다.
-실제 온디바이스 모델로 교체할 때 바꿀 함수는 `parse_intent()` 하나뿐이다.
-
-**2. 확인 대기 상태는 로컬에만 둔다.** 모델은 "사용자가 동의했다"까지만 말할 수 있고,
-실제 실행 인자는 로컬에 보관된 대기 상태에서만 꺼낸다.
-초기 구현에는 모델이 `confirmed=True`를 스스로 채워 게이트를 통과시킬 수 있는 구멍이 있었고,
-이 구조로 닫았다. *"대기 상태 없이 동의만 오면 아무 일도 일어나지 않는다"* 가 테스트에 박혀 있다.
-
-**2-1. 확인이 만능은 아니다.** 게이트는 3단계다 — 통과 / 확인 필요 / **확인으로도 거부**.
-확인만으로 모든 것을 열 수 있으면 안전 판단이 "응"이라고 말하는 승객에게 넘어간다.
-고속 주행 중 시트 자세 변경처럼 판단 근거가 차량 상태에 있는 경우엔 시스템이 거부하는 편이 맞다.
-`refuse`는 `confirmed=True`로도 열리지 않는다.
-
-**2-2. 확인에는 유효기간과 전제가 있다.** 물어본 지 30초가 지난 "응"은 그 동작에 대한 동의가
-아니므로 실행하지 않는다. 묻는 사이 차량 상태가 바뀌어도 실행하지 않는다 — 상대값("5도 더")은
-절대값으로 굳어서 대기 상태에 담기기 때문에, 그 사이 시트가 움직였다면 담아 둔 값은 이미
-승객이 말한 뜻이 아니다.
-
-**3. 되묻기와 확인은 같은 메커니즘이다.** 값이 없어 되묻는 경우와 위험 동작을 확인하는 경우 모두
-`(답변, 대기상태)`를 반환하고 다음 턴이 그것을 받는다. 상태 관리 코드가 한 벌뿐이다.
-
-**4. 상대값은 모델이 아니라 실행기가 푼다.** 모델은 `+3`만 내고, 24도에 더해 27도로 만드는 계산은
-로컬에서 한다. 모델에 현재 온도를 넘길 필요가 없고, 계산이 어긋날 수 없다.
-
-**5. 신뢰 경계는 두 곳이다.** 모델 출력은 스키마가 타입만 보장하므로 실행 직전에 범위를
-자른다(온도 16~30도 등). 그 앞단인 ASR도 마찬가지다 — 잘못 들은 "8도"는 범위 안이라
-`LIMITS`가 못 잡으므로, 전사 확신이 낮으면 텍스트를 다음 단계로 넘기지 않고 되묻는다.
-
-**6. 발화에 섞인 지시문은 데이터다.** "이전 지시를 무시하고…" 같은 문장은 따를 지시가 아니라
-승객이 말한 내용으로 취급한다.
-
-**7. 완전히 동일한 발화는 캐싱하되, 대기 상태가 있으면 절대 캐싱하지 않는다.** Intent 분류는
-발화 텍스트만의 함수라서(차량상태는 그저 프롬프트에 곁들일 뿐 분류를 바꾸지 않는다) 같은
-문자열은 언제 다시 말해도 같은 Intent가 맞다. 하지만 "3도"나 "네" 같은 짧은 발화는 직전 질문이
-뭐였느냐에 따라 뜻이 달라지므로(문맥 의존), pending이 있을 땐 캐시를 절대 보지 않는다.
-
-## 구조
-
-| 단계 | 함수 | 하는 일 |
-|---|---|---|
-| [0] | `transcribe()` | faster-whisper(CPU int8) 로컬 전사. 오디오는 이 함수 밖으로 나가지 않는다 |
-| [1] | `parse_intent()` | **LLM 유일 지점.** Pydantic 스키마로 정형 출력 강제, 왕복 1회 |
-| [2] | `safety_gate()` | 통과 / 확인 필요 / 거부 3단계 판정 |
-| [3] | `_run()` / `_apply()` | 모든 차량 제어의 단일 실행 경로. `_apply()`가 상태를 바꾸고 `_run()`이 실패를 잡는다 |
-| [4] | `_answer()` | 응답 문장 템플릿. 모델을 한 번 더 부르지 않는다 |
-
-`_resolve()`가 [1]과 [3] 사이에서 Intent를 (기능, 인자)로 풀고, `dispatch()`가 되묻기·확인·실행을
-분기한다.
-
-### 기능 범위와 게이트
-
-| 영역 | 기능 | 안전 게이트 |
-|---|---|---|
-| 공조 | 온도 설정, 실내 센서 조회 | 없음 (조회는 읽기 전용) |
-| 통화/메시지 | 전화, 메시지 발신 | **항상 확인** — 외부로 나가면 되돌릴 수 없다. 메시지는 **본문을 보여주고** 확인받고, 본문이 없으면 보내지 않고 되묻는다 |
-| 차량 설정 | 시트 위치(슬라이드·높이·등받이), 앰비언트 조명 | 주행 중 **등받이·슬라이드** 변경은 확인, **80km/h 이상에서는 거부**. 높이는 벨트·페달과 무관해 제외 |
-| 내비 | 목적지 설정 | 없음 — 사람이 계속 운전하므로 되돌리기 쉽고, 실제 내비 UX도 확인을 안 건다 |
-| 미디어 | 재생 | 없음 |
-
-등받이는 벨트 유효성을, 슬라이드는 페달 도달 거리를 바꾼다. 둘 다 주행 중 자세 변경이라
-같은 게이트를 탄다 — 초판은 등받이만 보고 슬라이드를 빼놓고 있었다.
-
-실내 센서(실내온도·외기온·일사량·습도·PM2.5·CO2)와 시트/조명 항목은 실제 차량 공조 시스템 구성과
-국산차 사용설명서의 메모리 시트 항목을 조사해 맞췄다.
-
-## 평가
-
-23건의 발화를 **튜닝셋 14 / 홀드아웃 9**로 분리한다. 홀드아웃은 프롬프트 수정에 한 번도 쓰지 않는다 —
-섞으면 점수는 오르고 실력은 오르지 않는다.
-
-지표 네 가지: **기능 선택 정확도**, **인자 정확도**, **게이트 정확도**(확인이 필요한 동작에서
-실제로 확인을 요구했는지 — 툴 이름이 맞은 케이스에서만 센다), 그리고 **미호출 정확도** —
-호출하지 않는 것이 정답인 케이스(값 없음, 없는 기능 요청, 프롬프트 인젝션)를 평가 세트에 정답으로
-포함한다. 안전 게이트가 이 프로젝트의 핵심 주장이라 미호출 정확도·게이트 정확도가 가장 중요한 지표다.
-
-케이스마다 차량 상태를 초기화한다. 상대값("3도 올려")의 정답이 시작 상태에 의존하므로,
-초기화가 없으면 실행 순서가 점수를 바꾼다.
-
-## 측정된 것 / 아직 아닌 것
-
-| 항목 | 상태 |
-|---|---|
-| 로컬 전사 지연 | **0.67초 중앙값** (base 모델, CPU int8, 2.4초 발화, 워밍업 후, n=3) |
-| 전사 정확도 | 1건 정확 — **표본 1건** |
-| 의도 추론 정확도 (tune) | tool 100% / args 100% / gate 100% / abstain 100% (`--eval --split tune`, n=14) |
-| 의도 추론 정확도 (holdout) | tool 100% / args 100% / gate 100% / abstain 100% (`--eval --split holdout`, n=9) |
-| 의도 추론 지연 | tune p50 2.93s / p95 3.46s, holdout p50 2.90s / p95 4.26s (effort=low, Claude Opus 5) |
-| 메시지 본문 | **채점에 포함됨**(3차부터). 위 args 수치는 본문 검사를 통과한 결과다 |
-| **반복 측정** | `--repeat 5`로 tune·holdout 각 5회: **10회 전부 네 지표 100%** (전 회차 동일) |
-| **실행 간 변이** | **관측됨** — 반복 측정 앞의 단일 실행 1회에서 tune 1건 오분류. 부호 수정 이후 tune 8회 중 1회 |
-
-측정하지 않은 것은 측정하지 않았다고 적는다. 수치는 실제로 돌린 뒤에 채운다.
-
-위 수치는 **메시지 본문 채점과 값 방향 규약을 넣은 뒤 다시 잰 값이다**(2026-09-07 3차).
-
-`--repeat`로 같은 split을 반복해 실행 간 변이를 본다. 단일 실행의 100%는 "이 실행에서 틀리지
-않았다"까지만 뜻하기 때문이다.
-
-```
-python car_agent.py --eval --split tune --repeat 5
-```
-
-**결과: tune 5/5, holdout 5/5 — 10회 전부 네 지표 100%, 전 회차 동일.**
-
-> ⚠️ 그래도 "변이가 없다"고는 못 쓴다. 반복 측정 **직전의 단일 실행 1회**에서
-> `'등받이를 뒤로 20도까지 눕혀줘'`가 오분류됐다(tool 92.9%). 부호 수정 이후 tune을 총 8회
-> 돌려 1회 실패했으니 케이스 단위로는 112건 중 1건이다. 5회 연속 100%는 실패율이 낮다는
-> 뜻이지 0이라는 뜻이 아니다 — 5회로는 10% 안팎의 실패율을 잡아내지 못한다.
-
-## 최종 결과
-
-23건 평가(튜닝 14 · 홀드아웃 9)에서 기능 선택·인자·게이트·미호출 정확도가 전부 100%였다.
-홀드아웃은 프롬프트 튜닝에 한 번도 쓰이지 않은 세트라 이 숫자는 채점 요령이 아니라 실측이다.
-
-다만 23건은 실패 모드를 통계적으로 담보하기엔 작은 표본이다. 100%는 "이 23개 케이스에서
-틀리지 않았다"는 뜻이지 "일반적으로 틀리지 않는다"는 뜻이 아니다. 이 프로토타입이 실제로
-증명하는 것은 정확도 숫자가 아니라 **구조**다 — 값이 없으면 코드가 실행을 막고, 되돌릴 수
-없는 동작은 코드가 확인을 요구하며, 모델이 스스로 그 게이트를 통과시킬 방법이 없다. 이 세
-가지는 프롬프트가 아니라 `needs_confirmation()`과 `_run()`이라는 코드 경로로 강제되어 있어서,
-모델의 판단이 달라져도 깨지지 않는다.
-
-의도 추론 지연(p50 2.8~2.9초대, effort=low)은 Claude Opus 5로 잰 것이고 이 모델은 실제 온디바이스
-경량 모델의 스탠드인이다 — 이 프로토타입이 검증하려던 것은 지연 자체가 아니라 왕복을 1회로
-고정하는 구조이므로, 이 숫자를 온디바이스 지연 목표와 직접 비교하지 않는다.
-
-23건 1회 채점의 API 비용은 **$0.07**이었다(Claude Opus 5, effort=low, 프롬프트 캐싱 적용).
-안전 보강·재실측·5회 반복까지 포함한 이번 세션 전체는 **$0.66**, 캐시 적중률 95.9%다.
-정확도 검증 자체는 저렴하다 — 비싼 건 모델을 쓰는 매 순간이 아니라 잘못된 실행이다.
-
-캐싱 적중도 실측했다: 동일 요청을 2회 호출하면 1회차는 `cache_creation_input_tokens`,
-2회차부터 `cache_read_input_tokens`으로 같은 크기가 잡히고 0.1배 가격에 읽힌다.
-
-**요청 1건의 토큰 내역** (`count_tokens` + 실제 `usage`, 2026-09-07 실측):
-
-| 구성 | 토큰 | 비고 |
-|---|---|---|
-| SYSTEM 프롬프트 | 941 | 캐시됨 |
-| **구조화 출력 스키마 + 스캐폴딩** | **2,403** | 캐시됨. **입력의 70%** |
-| 캐시 프리픽스 합계 | **3,339** | 2회차부터 0.1배 |
-| 발화 + 차량상태 (매번 새로) | 90 | 전액 |
-| 출력(Intent JSON) | 37 | |
-
-> 놀란 지점은 **스키마가 SYSTEM의 2.5배**라는 것이다. 프롬프트를 아무리 다듬어도 요청의 70%는
-> `Intent` 스키마다. 클라우드 비용을 줄이는 가장 큰 레버는 프롬프트가 아니라 **필드 수와 설명 길이**다.
-> (초기 측정치 2,276토큰은 규칙 6·7과 필드 설명을 추가하기 전 값이다 — 덮어쓰지 않고 밝혀 둔다.)
-
-**캐시가 실제로 얼마나 먹었나** — 이번 세션 전체(안전 보강·재실측·5회 반복 포함) 집계:
-
-| 항목 | 값 |
-|---|---|
-| 입력 토큰 | 791,556 |
-| 출력 토큰 | 9,454 |
-| **캐시 적중률** | **95.9%** |
-| 실제 비용 | **$0.66** |
-| 캐시가 없었다면 | 약 $4.2 (입력 전액 $5/1M) |
-
-입력 토큰 수만 보면 79만 개라 많아 보이지만 **96%가 0.1배 가격으로 읽힌 프리픽스**다.
-`--repeat`로 같은 프롬프트를 반복해서 그렇기도 하지만, 근본 원인은 이 에이전트의 요청이
-**고정 프리픽스 3,339 + 가변 90**이라는 모양이기 때문이다. 이 모양이 곧 온디바이스에서
-KV 캐시를 재사용할 수 있다는 뜻이기도 하다 — 아래 절로 이어진다.
-
-## 온디바이스로 옮기면 하드웨어가 되는가
-
-"온디바이스는 가정"이라고만 적고 넘어가면 그 가정의 값이 얼마인지 모른 채로 남는다. 아래는
-**공개 스펙에서 계산한 추정**이고, 이 프로젝트가 실기에서 측정한 값이 **아니다**.
-
-### 먼저: 차에 네트워크가 있는가 — 있지만 항상은 아니다
-
-양산차는 TMU로 LTE/5G에 붙어 있다. 문제는 커버리지가 아니라 **보장**이다. 터널·지하주차장·
-산간·국경 통과에서 끊기고, 붙어 있어도 지연이 수백 ms에서 수 초까지 튄다. 안전에 인접한 기능은
-"대개 된다"에 걸 수 없다.
-
-그래서 답은 온디바이스냐 클라우드냐가 아니라 **로컬 바닥을 깔고 그 위에 클라우드를 얹는 것**이다.
-그리고 이 프로토타입의 구조는 이미 그렇게 돼 있다 — 네트워크가 필요한 건 `parse_intent()` 하나뿐이고
-게이트·실행·응답은 전부 로컬 결정적 코드다. **망이 끊기면 "못 알아듣는다"로 degrade하지
-"위험하게 동작한다"로 가지 않는다.** 안전 판정이 네트워크 뒤에 있으면 그 자체가 설계 결함이다.
-
-### 그럼 `parse_intent()`를 보드에 올릴 수 있나
-
-LLM 디코딩의 병목은 연산량(TOPS)이 아니라 **메모리 대역폭**이다. 토큰 하나를 뽑을 때마다 가중치를
-통째로 한 번 읽기 때문에, 디코드 속도의 상한은 대략 `대역폭 ÷ 모델 크기`다.
-
-Jetson Orin Nano 8GB 기준(원래 68 GB/s·7~15W, JetPack 6 super 모드 102 GB/s·25W):
-
-| 모델 | INT4 크기 | 디코드 상한 (102 GB/s) | 실효 추정 |
-|---|---|---|---|
-| ~1B | 0.6~0.7 GB | ~150 tok/s | **80~110 tok/s** |
-| ~3B | 1.7~1.9 GB | ~57 tok/s | 30~40 tok/s |
-| ~8B | 4.5~5 GB | ~22 tok/s | 11~15 tok/s |
-
-### 진짜 병목은 모델 크기가 아니라 **prefill**이었다
-
-이 에이전트의 워크로드는 특이하다. 출력은 `Intent` JSON 하나라 **디코드가 37토큰**(실측)인데,
-입력은 **3,429토큰**이다. 그런데 그 내역이 중요하다 — SYSTEM은 941토큰뿐이고 **2,403토큰이 구조화
-출력 스키마**다(위 캐싱 절의 표).
-
-**그리고 그 2,403토큰은 온디바이스로 옮기면 사라진다.** 클라우드 API에서 스키마는 컨텍스트에 실려
-가는 토큰이지만, 로컬 추론에서는 **문법 제약 디코딩**(GBNF·outlines 류)으로 컴파일되어 디코더의
-제약이 된다 — 컨텍스트를 한 토큰도 쓰지 않는다. 즉 온디바이스 프리필 대상은 3,429가 아니라
-**SYSTEM 941 + 발화 90 ≈ 1,031토큰**이다.
-
-여기에 이미 있는 설계가 하나 더 붙는다. **SYSTEM이 고정이고 매 요청 바뀌는 값은 user 쪽에 붙인다**는
-규칙(`CLAUDE.md` 불변 조건) 덕분에, 시동 시 SYSTEM 941토큰의 KV 캐시를 한 번 만들어 두면 발화마다
-새로 프리필할 것은 **90토큰뿐**이다. 클라우드에서 `cache_read`로 나타난 이득이 온디바이스에서는
-KV 재사용으로 나타난다 — **같은 설계 결정이 두 환경에서 각각 효과를 낸다.**
-
-| 구성 (1B INT4) | 프리필 | 디코드 | 합계(추정) |
-|---|---|---|---|
-| 스키마를 토큰으로, KV 재사용 없음 | 5~7s | 0.4~0.5s | **6~8s — 불가** |
-| 문법 제약, KV 재사용 없음 | 1.2~2.1s | 0.4~0.5s | 1.6~2.6s — 느리다 |
-| **문법 제약 + KV 재사용** | **0.1~0.2s** | **0.4~0.5s** | **0.5~0.7s — 가능** |
-| 3B INT4, 문법 제약 + KV 재사용 | 0.2~0.3s | 0.9~1.2s | 1.1~1.5s |
-
-로컬 전사 0.67초(실측)가 앞에 붙으므로 종단 **1.2~1.4초**. 차 안 음성 응답으로 쓸 만하다.
-1B에서 3B로 올려도 종단 2초 안쪽이라, 정확도가 부족하면 여유가 아주 없지는 않다.
-
-**결론: 이 좁은 과제에 한해서는 Orin Nano 8GB에서 될 것으로 보인다.** 단 조건이 붙는다 —
-1~2B급 모델, INT4, SYSTEM KV 재사용, 제약 디코딩. 자유 대화나 7B급은 이 보드에서 안 된다.
-그리고 이 프로젝트가 그 조건을 이미 만족하는 모양으로 설계돼 있다는 점이 중요하다(왕복 1회,
-고정 SYSTEM, 짧은 정형 출력).
-
-### 그런데 양산에 Orin Nano를 올리진 않는다
-
-Orin Nano는 개발보드다. AEC-Q100·ASIL 등급이 없고, 차량 온도 범위(-40~85℃)와 15년 공급을
-보장하지 않는다. 그리고 **모듈 가격이 차량 원가가 아니다** — 검증·EMC·기능안전·수명 공급을 얹으면
-모듈값의 몇 배가 된다. 보드를 하나 더 얹는 선택은 그래서 비싸다.
-
-**원가를 통제하는 방법은 보드를 더하지 않는 것이다.** 요즘 차의 콕핏 도메인 컨트롤러(예: Snapdragon
-8295급, NPU 약 30 TOPS)는 클러스터·인포테인먼트·HUD를 이미 굴리고 있고 **NPU는 대부분 유휴**다.
-1B INT4는 0.6~0.8GB라 기존 메모리 예산 안에 들어간다. 여기에 얹으면 BOM 추가는 0에 가깝다.
-
-### 전력은 추론이 아니라 **상시 대기**가 문제다
-
-추론 자체는 무시할 수준이다. 10W를 0.5초 쓰면 5J = **0.0014 Wh**, 하루 100발화라도 0.14 Wh다.
-75kWh 팩에서 의미 없는 숫자다.
-
-문제는 상시 켜두는 쪽이다. 전용 보드를 7~15W로 상시 구동하면 주행 중에는 티가 안 나지만
-**주차 중 12V 배터리를 며칠 만에 방전**시킨다. 팬 없는 밀폐 하우징의 열 예산도 상시 부하 기준으로
-잡히므로 원가가 또 오른다.
-
-통제 방법은 넷이다.
-
-1. **듀티 사이클링** — 웨이크워드는 mW급 상시 DSP가 맡고, NPU는 발화 구간에만 깨운다.
-2. **실리콘 재사용** — 전용 보드 대신 콕핏 SoC의 유휴 NPU. BOM·열·검증 비용을 동시에 줄인다.
-3. **모델을 메모리 예산 안에** — 1~2B INT4. 크기를 키우면 대역폭과 상주 메모리가 같이 오른다.
-4. **시동 시 KV 캐시 1회** — 발화당 연산을 프리필이 아니라 디코드만으로 줄인다.
-
-### 그런데 1번과 4번은 서로 충돌한다
-
-전력을 아끼려고 깊게 재우면 **KV 캐시가 날아가고**, 깨어날 때마다 SYSTEM 941토큰을 다시 프리필해야
-한다. 위 표에서 "가능"을 만든 것이 바로 그 KV 재사용이므로, 순진하게 전력 게이팅을 걸면 응답이
-0.5초에서 2초대로 돌아간다. **대기 전력을 차단하는 방향으로만 밀면 지연을 잃는다.**
-
-다행히 이 충돌은 싸게 풀린다. 941토큰짜리 KV 캐시는 1B급 모델에서 **대략 15~30MB**다
-(2 × 레이어 × KV헤드 × head_dim × 941토큰, INT8~FP16 기준 추정). 그래서:
-
-- **연산만 게이팅하고 DRAM은 self-refresh로 유지한다.** 수십 MB를 붙들어 두는 비용은 mW 단위이고,
-  NPU/CPU 클럭을 죽이는 데서 오는 절감이 훨씬 크다.
-- 완전 절전이 필요하면 **KV 캐시를 플래시에 두고 복원**한다. 30MB를 UFS에서 읽는 데 수십 ms면 되므로
-  프리필 1.2~2.1초를 다시 치르는 것보다 압도적으로 싸다.
-
-즉 답은 "대기 전력을 차단한다"가 아니라 **"연산은 재우고 상태는 남긴다"** 다.
-차량에서 기억해야 할 상태가 수십 MB뿐이라는 것이 이 설계의 이득이고, 그것도 SYSTEM을 고정으로
-두었기 때문에 생긴 결과다.
-
-### 이 절에서 측정된 것과 아닌 것
-
-측정된 것은 **토큰 내역(SYSTEM 941 / 스키마 2,403 / 발화 90 / 출력 37)** 과 **로컬 전사 0.67초**
-뿐이다. 나머지 tok/s·초·와트는 전부 공개 스펙에서 계산한 추정이고, **이 프로젝트는 Jetson에서
-아무것도 돌려보지 않았다.** 실기를 구하면 1B INT4를 올려 프리필·디코드·전력을 실측하는 것이 다음
-단계이고, 그때 가장 먼저 확인할 것은 **문법 제약 디코딩이 정말 컨텍스트를 안 쓰는지**와
-**KV 캐시를 시동 시 만들어 재사용하는 것이 실제로 되는지**다 — 위 표의 "가능"은 그 둘에 걸려 있다.
-
-## 알려진 한계
-
-- **차량 연동은 목업이다.** 실제 CAN/차량 API에 붙지 않는다. 검증한 것은 연동이 아니라
-  판단과 안전 게이트다.
-- **온디바이스는 가정이고, 그 가정의 하드웨어 비용을 실측한 적이 없다.** 의도 추론은 현재 클라우드
-  API를 호출하며 경량 모델의 스탠드인이다. 위 "온디바이스로 옮기면 하드웨어가 되는가" 절의 계산은
-  공개 스펙 기반 추정이고 **Jetson을 포함해 어떤 엣지 보드에서도 돌려보지 않았다.** 특히
-  프리필 추정은 **문법 제약 디코딩으로 스키마 2,403토큰이 사라진다**는 전제와 **KV 캐시를 시동 시
-  만들어 재사용한다**는 전제 위에 서 있는데, 둘 다 구현하지도 측정하지도 않았다 — 지금 구조에서
-  온디바이스 실현성의 최대 미지수다.
-- **한 턴에 한 기능.** 여러 기능을 한 발화로 연쇄 호출하는 경우는 다루지 않는다.
-- **화자 구분이 없다.** 마이크가 누가 말했는지(운전석·조수석) 구분하지 않는다. 시트 조작이
-  `zone="driver"`로 무조건 고정돼 있던 버그는 고쳤다 — 이제 `Intent.seat_zone`으로 "조수석"
-  같은 명시를 받으면 그 좌석을 조작하고, 명시가 없을 때만 운전석을 기본값으로 쓴다
-  (`_resolve()`, `--selftest`로 로직 검증). 다만 **"조수석 등받이 세워줘" 같은 실제 발화에서
-  모델이 `seat_zone`을 정확히 채우는지는 API 호출 없이는 검증할 수 없어 아직 미실측**이고,
-  근본적으로 발화만으로는 알 수 없는 경우(그냥 "내 시트 세워줘")엔 여전히 운전석으로 처리된다 —
-  진짜 화자 구분은 마이크 어레이 같은 하드웨어가 있어야 풀리는 문제다.
-- **안전 임계값이 실측으로 정해진 값이 아니다.** 확인 유효기간 30초, 자세 변경 거부 80km/h,
-  전사 신뢰도 하한(`avg_logprob` -1.0 / `no_speech_prob` 0.6)은 근거를 적어 두긴 했으나
-  실차 데이터로 튜닝한 값이 아니다. 특히 ASR 임계값은 **정상 발화 1건이 통과하는 것만 확인**했고,
-  실제로 잘못 들은 발화를 걸러내는지는 그런 표본이 없어 검증하지 못했다 — 오탐/미탐률 미측정.
-- **발화 캐시(`_INTENT_CACHE`)는 오답도 그대로 고정한다.** 같은 문자열의 첫 분류가 틀렸다면
-  그 세션 내내 같은 틀린 답을 반복한다. 크기 상한이나 만료도 없어 프로세스가 오래 살아있으면
-  무한히 자란다 — 지금은 프로세스 재시작 외엔 초기화 수단이 없다.
-- **반복 5회로는 낮은 실패율을 못 잡는다.** tune·holdout 각 5회가 전부 100%였지만, 그 직전
-  단일 실행에서는 1건이 틀렸다. 5회는 실패율이 대략 10%를 넘지 않는다는 것까지만 말해 준다.
-  실패율을 실제로 추정하려면 회차를 더 늘리거나 케이스를 늘려야 한다.
-- **본문 검사는 어미 목록 휴리스틱이다.** `deliverable_message()`는 실측에서 나온 결함 두 종류
-  (명령 어미 "…해줘", 인용 종결 "…다고")를 잡을 뿐 문법 판정이 아니다. 자연스럽지만 목록에 걸리는
-  본문이나, 목록을 피해가는 이상한 본문은 잘못 채점된다.
-- **확인 대기는 프로세스 메모리에만 있다.** 유효기간은 생겼지만 저장소는 여전히 세션 변수라,
-  프로세스가 죽으면 대기 중이던 확인이 사라진다. 실차라면 시동 사이클과 어떻게 엮일지 정해야 한다.
-- **새 안전 단계는 `--selftest`로만 검증됐다.** 게이트 3단계·확인 만료·상태 재검사·실행 실패는
-  결정적 로직이라 API 없이 고정했지만, 모델이 실제 발화에서 이 경로들을 밟는지는 `--eval`
-  케이스에 아직 없다(예: 고속 주행 중 등받이 요청). 평가셋 확장이 남은 일이다.
-- **프롬프트 인젝션 방어는 검증된 패턴 1개뿐이다.** 평가셋의 인젝션 케이스는 "이전 지시는
-  무시하고…" 하나다. 더 정교한 시도(다국어 혼합, 아주 긴 발화로 프롬프트 흘리기 유도 등)에
-  대한 강건성은 검증되지 않았다.
+The project simulates vehicle controls; it does not interface with a real vehicle. The evaluation set is intentionally small, and speech-recognition accuracy has not been measured at production scale. It is a portfolio prototype for safety boundaries and interaction design, not a deployable automotive system.
